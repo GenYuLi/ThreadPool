@@ -13,6 +13,7 @@
 #include <latch>
 #include <stop_token>
 #include <move_only_function>
+#include <coroutine>
 
 class ThreadPool {
 public:
@@ -32,6 +33,28 @@ private:
 	std::mutex queue_mutex;
 	std::latch latch;
 	bool stop;
+
+	// coroutine task type
+	struct CoroutineTask {
+		struct promise_type {
+			CoroutineTask get_return_object() {
+				return CoroutineTask{
+				  std::coroutine_handle<promise_type>::from_promise(*this)};
+			}
+			std::suspend_always initial_suspend() { return {}; }
+			std::suspend_always final_suspend() noexcept { return {}; }
+			void return_void() {}
+			void unhandled_exception() { std::terminate(); }
+		};
+
+		std::coroutine_handle<promise_type> handle;
+
+		CoroutineTask(std::coroutine_handle<promise_type> h) : handle(h) {}
+		~CoroutineTask() {
+			if (handle)
+				handle.destroy();
+		}
+	};
 };
 
 // the constructor just launches some amount of workers
@@ -80,6 +103,29 @@ auto ThreadPool::enqueue(F&& f, Args&&... args)
 	}
 	latch.count_down();
 	return res;
+}
+
+// add new coroutine task to the pool
+template <class F, class... Args>
+auto ThreadPool::enqueue_coroutine(F&& f, Args&&... args)
+  -> CoroutineTask
+{
+	auto task = [f = std::forward<F>(f), ...args = std::forward<Args>(args)]() -> CoroutineTask {
+		co_await std::suspend_always{};
+		std::invoke(f, args...);
+	};
+
+	{
+		std::unique_lock<std::mutex> lock(queue_mutex);
+
+		// don't allow enqueueing after stopping the pool
+		if (stop)
+			throw std::runtime_error("enqueue on stopped ThreadPool");
+
+		tasks.emplace([task]() { task(); });
+	}
+	latch.count_down();
+	return task();
 }
 
 // the destructor joins all threads
